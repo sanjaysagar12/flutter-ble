@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:audioplayers/audioplayers.dart';
 
 void main() {
   runApp(const MyApp());
@@ -56,19 +59,32 @@ class _ZAlarmeeHomePageState extends State<ZAlarmeeHomePage> {
   List<ScanResult> _scanResults = [];
   final List<BluetoothDevice> _connectedDevices = [];
 
-  // Simulation for previously connected devices (persisted IDs in a real app)
-  // For now, we'll just track devices we disconnect from during this session
+  // Tracking
   final List<BluetoothDevice> _previouslyConnectedDevices = [];
+  final Set<String> _intentionalDisconnects =
+      {}; // Track user-initiated disconnects
+  final Map<String, StreamSubscription<BluetoothConnectionState>>
+      _connectionSubscriptions = {};
 
+  // Inputs
   bool _isScanning = false;
   late StreamSubscription<List<ScanResult>> _scanResultsSubscription;
   late StreamSubscription<bool> _isScanningSubscription;
+
+  // Alarm State
+  final AudioPlayer _audioPlayer = AudioPlayer();
+  bool _isAlarmPlaying = false;
 
   @override
   void initState() {
     super.initState();
     _initPermissions();
     _initBluetooth();
+    _setupAudio();
+  }
+
+  void _setupAudio() {
+    _audioPlayer.setReleaseMode(ReleaseMode.loop); // Loop the alarm
   }
 
   Future<void> _initPermissions() async {
@@ -105,6 +121,10 @@ class _ZAlarmeeHomePageState extends State<ZAlarmeeHomePage> {
   void dispose() {
     _scanResultsSubscription.cancel();
     _isScanningSubscription.cancel();
+    for (var sub in _connectionSubscriptions.values) {
+      sub.cancel();
+    }
+    _audioPlayer.dispose();
     super.dispose();
   }
 
@@ -120,6 +140,10 @@ class _ZAlarmeeHomePageState extends State<ZAlarmeeHomePage> {
     await FlutterBluePlus.stopScan();
     try {
       await device.connect();
+
+      // Clear intention flag if it existed
+      _intentionalDisconnects.remove(device.remoteId.toString());
+
       setState(() {
         if (!_connectedDevices.contains(device)) {
           _connectedDevices.add(device);
@@ -128,15 +152,56 @@ class _ZAlarmeeHomePageState extends State<ZAlarmeeHomePage> {
           _previouslyConnectedDevices.remove(device);
         }
       });
+
+      // Start monitoring connection state
+      _monitorConnection(device);
     } catch (e) {
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text("Connection failed: $e")));
     }
   }
 
+  void _monitorConnection(BluetoothDevice device) {
+    if (_connectionSubscriptions.containsKey(device.remoteId.toString())) {
+      return; // Already monitoring
+    }
+
+    final sub = device.connectionState.listen((state) {
+      if (state == BluetoothConnectionState.disconnected) {
+        // Check if intentional
+        if (!_intentionalDisconnects.contains(device.remoteId.toString())) {
+          // Unintentional Disconnect -> TRIGGER ALARM
+          _triggerAlarm(device);
+        }
+
+        // Cleanup local state
+        setState(() {
+          _connectedDevices.remove(device);
+          if (!_previouslyConnectedDevices.contains(device)) {
+            _previouslyConnectedDevices.add(device);
+          }
+        });
+
+        // Cancel subscription for this device as it's disconnected
+        _connectionSubscriptions[device.remoteId.toString()]?.cancel();
+        _connectionSubscriptions.remove(device.remoteId.toString());
+      }
+    });
+
+    _connectionSubscriptions[device.remoteId.toString()] = sub;
+  }
+
   Future<void> _disconnectFromDevice(BluetoothDevice device) async {
+    // Mark as intentional
+    _intentionalDisconnects.add(device.remoteId.toString());
+
     try {
+      // Stop monitoring immediately to allow manual disconnect without triggering logic
+      _connectionSubscriptions[device.remoteId.toString()]?.cancel();
+      _connectionSubscriptions.remove(device.remoteId.toString());
+
       await device.disconnect();
+
       setState(() {
         _connectedDevices.remove(device);
         if (!_previouslyConnectedDevices.contains(device)) {
@@ -146,6 +211,131 @@ class _ZAlarmeeHomePageState extends State<ZAlarmeeHomePage> {
     } catch (e) {
       debugPrint("Disconnection failed: $e");
     }
+  }
+
+  void _triggerAlarm(BluetoothDevice device) async {
+    if (_isAlarmPlaying) return; // Already playing
+
+    setState(() {
+      _isAlarmPlaying = true;
+    });
+
+    // Play Alarm (Generated Sine Wave)
+    // 440Hz sine wave for 1 second, looped
+    try {
+      final bytes = _generateSineWave(440, 1.0);
+      await _audioPlayer.play(BytesSource(bytes));
+    } catch (e) {
+      debugPrint("Error playing alarm: $e");
+    }
+
+    // Show Alarm Dialog
+    if (!mounted) return;
+    showDialog(
+        context: context,
+        barrierDismissible: false, // User must tap Stop
+        builder: (context) {
+          return AlertDialog(
+            backgroundColor: Colors.red[50],
+            title: const Row(
+              children: [
+                Icon(Icons.warning_amber_rounded, color: Colors.red, size: 30),
+                SizedBox(width: 10),
+                Text("Device Disconnected!",
+                    style: TextStyle(color: Colors.red)),
+              ],
+            ),
+            content: Text(
+              "${device.platformName} has disconnected unexpectedly.",
+              style: const TextStyle(fontSize: 16),
+            ),
+            actions: [
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: () {
+                    _stopAlarm();
+                    Navigator.of(context).pop();
+                  },
+                  icon: const Icon(Icons.stop_circle_outlined,
+                      color: Colors.white),
+                  label: const Text("STOP ALARM",
+                      style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold)),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.red,
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                ),
+              )
+            ],
+          );
+        });
+  }
+
+  void _stopAlarm() {
+    _audioPlayer.stop();
+    setState(() {
+      _isAlarmPlaying = false;
+    });
+  }
+
+  // Generates a simple WAV file in memory with a sine wave
+  Uint8List _generateSineWave(double frequency, double durationSeconds) {
+    const int sampleRate = 44100;
+    const int numChannels = 1;
+    final int numSamples = (durationSeconds * sampleRate).toInt();
+    final int byteRate = sampleRate * numChannels * 2; // 16-bit
+    final int blockAlign = numChannels * 2;
+    final int dataSize = numSamples * blockAlign;
+    final int fileSize = 36 + dataSize;
+
+    final ByteData byteData = ByteData(44 + dataSize);
+
+    // RIFF chunk
+    byteData.setUint8(0, 0x52); // R
+    byteData.setUint8(1, 0x49); // I
+    byteData.setUint8(2, 0x46); // F
+    byteData.setUint8(3, 0x46); // F
+    byteData.setUint32(4, fileSize, Endian.little);
+    byteData.setUint8(8, 0x57); // W
+    byteData.setUint8(9, 0x41); // A
+    byteData.setUint8(10, 0x56); // V
+    byteData.setUint8(11, 0x45); // E
+
+    // fmt chunk
+    byteData.setUint8(12, 0x66); // f
+    byteData.setUint8(13, 0x6d); // m
+    byteData.setUint8(14, 0x74); // t
+    byteData.setUint8(15, 0x20); // space
+    byteData.setUint32(16, 16, Endian.little); // chunk size
+    byteData.setUint16(20, 1, Endian.little); // audio format (PCM)
+    byteData.setUint16(22, numChannels, Endian.little);
+    byteData.setUint32(24, sampleRate, Endian.little);
+    byteData.setUint32(28, byteRate, Endian.little);
+    byteData.setUint16(32, blockAlign, Endian.little);
+    byteData.setUint16(34, 16, Endian.little); // bits per sample
+
+    // data chunk
+    byteData.setUint8(36, 0x64); // d
+    byteData.setUint8(37, 0x61); // a
+    byteData.setUint8(38, 0x74); // t
+    byteData.setUint8(39, 0x61); // a
+    byteData.setUint32(40, dataSize, Endian.little);
+
+    // Samples
+    int offset = 44;
+    for (int i = 0; i < numSamples; i++) {
+      final double t = i / sampleRate;
+      final double sample = sin(2 * pi * frequency * t);
+      final int sampleInt = (sample * 32767).toInt();
+      byteData.setInt16(offset, sampleInt, Endian.little);
+      offset += 2;
+    }
+
+    return byteData.buffer.asUint8List();
   }
 
   void _navigateToDeviceDetails(BluetoothDevice device) {
